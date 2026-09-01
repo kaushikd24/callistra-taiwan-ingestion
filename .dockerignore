@@ -1,0 +1,9 @@
+.git/
+.venv/
+__pycache__/
+*.pyc
+.env*
+*.har
+output/
+company_mapping_full_with_gics_no_id.csv
+stockanalysis_master_list.csv

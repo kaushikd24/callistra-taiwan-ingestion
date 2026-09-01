@@ -1,0 +1,7 @@
+boto3==1.42.72
+beautifulsoup4==4.14.3
+cloud-sql-python-connector[pg8000]==1.18.3
+google-auth==2.48.0
+pg8000==1.31.5
+python-dotenv==1.2.1
+requests==2.32.5
