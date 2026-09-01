@@ -129,11 +129,21 @@ def fetch_daily_announcements(session: requests.Session) -> list[Announcement]:
 
 
 def fetch_detail_html(session: requests.Session, item: Announcement) -> str:
-    response = session.post(DETAIL_URL, data=item.detail_form, timeout=45)
-    response.raise_for_status()
-    if "Material Information" not in response.text and "Today's Information" not in response.text:
-        raise ValueError(f"Unexpected eMOPS detail response for {item.native_key}")
-    return response.text
+    error: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = session.post(DETAIL_URL, data=item.detail_form, timeout=45)
+            response.raise_for_status()
+            if "Material Information" not in response.text and "Today's Information" not in response.text:
+                raise ValueError(f"Unexpected eMOPS detail response for {item.native_key}")
+            return response.text
+        except (requests.RequestException, ValueError) as exc:
+            error = exc
+            if attempt < 2:
+                delay = 1 + attempt * 2
+                logging.warning("eMOPS detail %s failed (%s); retrying in %ss", item.native_key, exc, delay)
+                time.sleep(delay)
+    raise RuntimeError(f"eMOPS detail {item.native_key} failed after three attempts") from error
 
 
 def canonical_doc_type(subject: str, detail_html: str) -> str:
@@ -259,9 +269,17 @@ def run_once(*, dry_run: bool, max_documents: int | None = None) -> tuple[int, i
         if not dry_run and exists_in_database(item.native_key):
             skipped += 1
             continue
-        detail_html = fetch_detail_html(session, item)
-        mmd = html_to_mmd(detail_html)
-        doc_type = canonical_doc_type(item.subject, detail_html)
+        try:
+            detail_html = fetch_detail_html(session, item)
+            mmd = html_to_mmd(detail_html)
+            doc_type = canonical_doc_type(item.subject, detail_html)
+        except Exception:
+            # Do not abandon a full daily cycle because one legacy detail page
+            # is temporarily unavailable. It is absent from the sidecar table
+            # and will be retried on the next hourly poll.
+            logging.exception("Failed to fetch/parse %s; leaving it for the next cycle", item.native_key)
+            skipped += 1
+            continue
         if dry_run:
             logging.info("Would ingest %s as %s", item.native_key, doc_type)
             created += 1
