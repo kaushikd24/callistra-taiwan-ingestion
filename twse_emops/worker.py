@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as datetime_time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -64,8 +64,21 @@ def request_session() -> requests.Session:
     return session
 
 
+def sanitize_nul(value: Any) -> Any:
+    """Remove NUL bytes, which PostgreSQL does not permit in UTF-8 text."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {sanitize_nul(key): sanitize_nul(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_nul(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_nul(item) for item in value)
+    return value
+
+
 def _text(cell: Tag) -> str:
-    return " ".join(cell.get_text(" ", strip=True).split())
+    return sanitize_nul(" ".join(cell.get_text(" ", strip=True).split()))
 
 
 def parse_list_page(source_html: str) -> tuple[list[Announcement], int]:
@@ -136,7 +149,7 @@ def fetch_detail_html(session: requests.Session, item: Announcement) -> str:
             response.raise_for_status()
             if "Material Information" not in response.text and "Today's Information" not in response.text:
                 raise ValueError(f"Unexpected eMOPS detail response for {item.native_key}")
-            return response.text
+            return sanitize_nul(response.text)
         except (requests.RequestException, ValueError) as exc:
             error = exc
             if attempt < 2:
@@ -192,7 +205,7 @@ def html_to_mmd(source_html: str) -> str:
             if value:
                 prefix = "### " if tag.name in {"h1", "h2", "h3", "h4"} else ""
                 blocks.append(prefix + value)
-    return "\n\n".join(blocks).strip() + "\n"
+    return sanitize_nul("\n\n".join(blocks).strip() + "\n")
 
 
 class Storage:
@@ -201,7 +214,8 @@ class Storage:
         self.client = boto3.client("s3")
 
     def put(self, key: str, content: str, content_type: str) -> str:
-        self.client.put_object(Bucket=self.bucket, Key=key, Body=content.encode("utf-8"), ContentType=content_type)
+        clean_content = sanitize_nul(content)
+        self.client.put_object(Bucket=self.bucket, Key=key, Body=clean_content.encode("utf-8"), ContentType=content_type)
         return f"s3://{self.bucket}/{key}"
 
 
@@ -217,7 +231,16 @@ def exists_in_database(native_key: str) -> bool:
 def persist(item: Announcement, detail_html: str, mmd: str, raw_html_path: str, mmd_path: str, document_type: str) -> bool:
     db = get_analytics_db()
     published_at = datetime.combine(item.announced_on, item.announced_at, tzinfo=TAIPEI)
-    metadata = json.dumps({"native_key": item.native_key, "detail_endpoint": DETAIL_URL, "detail_request": item.detail_form})
+    # Legacy eMOPS responses occasionally contain literal NUL bytes. Sanitize
+    # every source-derived SQL value immediately before binding it to pg8000.
+    safe_item = sanitize_nul(asdict(item))
+    safe_detail_form = sanitize_nul(item.detail_form)
+    safe_metadata = sanitize_nul({
+        "native_key": item.native_key,
+        "detail_endpoint": DETAIL_URL,
+        "detail_request": safe_detail_form,
+    })
+    metadata = json.dumps(safe_metadata)
     with db.connection() as conn:
         conn.autocommit = False
         cur = conn.cursor()
@@ -229,8 +252,10 @@ def persist(item: Announcement, detail_html: str, mmd: str, raw_html_path: str, 
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)
                 ON CONFLICT (native_key) DO NOTHING
                 RETURNING id
-            """, (item.native_key, item.company_code, item.company_name, item.market, item.announced_on, item.announced_at,
-                  item.sequence_no, item.subject, DETAIL_URL, json.dumps(item.detail_form), json.dumps(asdict(item), default=str), raw_html_path, mmd_path))
+            """, (safe_item["company_code"] + f":{item.announced_on:%Y%m%d}:{item.announced_at:%H%M%S}:{item.sequence_no}",
+                  safe_item["company_code"], safe_item["company_name"], safe_item["market"], item.announced_on, item.announced_at,
+                  item.sequence_no, safe_item["subject"], DETAIL_URL, json.dumps(safe_detail_form),
+                  json.dumps(safe_item, default=str), sanitize_nul(raw_html_path), sanitize_nul(mmd_path)))
             row = cur.fetchone()
             if row is None:
                 conn.rollback()
@@ -246,8 +271,10 @@ def persist(item: Announcement, detail_html: str, mmd: str, raw_html_path: str, 
                      'material_information', 'company', %s, %s, 'TWSE', 'TAIWAN', 'TW', %s,
                      %s, %s, %s, 'ocr_completed', false, 'not_required', %s::jsonb)
                 RETURNING id
-            """, (sidecar_id, f"{item.native_key}.html", item.subject, document_type, item.company_code,
-                  [item.company_code], item.company_name, published_at, raw_html_path, mmd_path, metadata))
+            """, (sidecar_id, f"{safe_item['company_code']}:{item.announced_on:%Y%m%d}:{item.announced_at:%H%M%S}:{item.sequence_no}.html",
+                  safe_item["subject"], sanitize_nul(document_type), safe_item["company_code"],
+                  [safe_item["company_code"]], safe_item["company_name"], published_at,
+                  sanitize_nul(raw_html_path), sanitize_nul(mmd_path), metadata))
             document_id = cur.fetchone()[0]
             cur.execute("UPDATE twse_emops_documents SET document_id = %s, updated_at = now() WHERE id = %s", (document_id, sidecar_id))
             conn.commit()
